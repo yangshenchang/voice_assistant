@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from voice_assistant import VoiceAssistant
 from voice_assistant.adapter import AudioDeviceAdapter
+from voice_assistant.kws import KeywordWakeDetector
 
 
 # ================================================================
@@ -89,11 +90,18 @@ END_WORDS = [
     "忙你的去吧", "你忙吧", "不打扰你了", "你继续",
     "跪安", "朕知道了", "爱卿退下",
 ]
-AWAKE_TIMEOUT = 60.0  # seconds
+AWAKE_TIMEOUT = 600.0  # seconds
 CONTEXT_TIMEOUT = 3600.0  # 1 hour
 
 # Audio device
 ECHO_CANCELLATION = True  # Mute mic while playing AI speech
+
+# KWS (local keyword spotting with sherpa-onnx)
+# Set to None to disable and fall back to cloud-STT-based wake word detection
+KWS_ENABLED = True
+KWS_KEYWORDS = ["小牛"]       # Keywords to detect locally
+KWS_MODEL_DIR = None          # None = use the default bundled model
+KWS_THRESHOLD = 0.25          # Detection confidence threshold (lower = more sensitive)
 
 
 # ================================================================
@@ -101,8 +109,23 @@ ECHO_CANCELLATION = True  # Mute mic while playing AI speech
 # ================================================================
 
 async def main():
+    # --- KWS (local keyword spotting) ---
+    kws = None
+    if KWS_ENABLED:
+        print(f"🔑 Loading local KWS model for keywords: {KWS_KEYWORDS}")
+        kws = KeywordWakeDetector(
+            keywords=KWS_KEYWORDS,
+            model_dir=KWS_MODEL_DIR,
+            keywords_threshold=KWS_THRESHOLD,
+            debug=True,
+        )
+        print(f"✅ KWS ready (offline wake-word detection)")
+    else:
+        print("⚠️  KWS disabled — using cloud STT for wake-word detection (not cost-effective)")
+
     # --- Build pipeline ---
     assistant = VoiceAssistant(
+        kws=kws,
         stt_api_key=DASHSCOPE_API_KEY,
         stt_language=STT_LANGUAGE,
         tts_api_key=BAIDU_TTS_API_KEY if TTS_PROVIDER == "baidu" else DASHSCOPE_API_KEY,

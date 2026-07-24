@@ -17,6 +17,7 @@ from .vad import SpeechDetector, StandardSpeechDetector
 from .stt import AliyunASRSpeechRecognizer, SpeechRecognizer
 from .llm import LLMService, LLMResponse, NanobotWebSocketService
 from .tts import BaiduSpeechSynthesizer, CosyVoiceSpeechSynthesizer, SpeechSynthesizer
+from .kws import KeywordWakeDetector
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,8 @@ class VoiceAssistant:
         vad_volume_threshold: float = -40.0,
         vad_silence_threshold: float = 0.5,
         vad_sample_rate: int = 16000,
+        # KWS (local keyword spotting)
+        kws: "KeywordWakeDetector | None" = None,
         # Wake / context
         wakewords: List[str] = None,
         end_words: List[str] = None,
@@ -133,6 +136,9 @@ class VoiceAssistant:
             sample_rate=vad_sample_rate,
             debug=debug,
         )
+
+        # --- KWS -----------------------------------------------------------
+        self.kws = kws
 
         @self.vad.on_speech_detected
         async def _on_speech(data: bytes, dur: float, sid: str):
@@ -327,7 +333,25 @@ class VoiceAssistant:
             txn_id = str(uuid4())
             t_vad = time()  # T0: VAD silence confirmed → invoke starts
 
-            # ---- 1. STT --------------------------------------------------
+            # ---- 1. KWS pre-check (local, before cloud STT) ---------------
+            # If the session is not awake and we have a local KWS model,
+            # run it first to avoid paying for cloud STT on non-wake-word audio.
+            sid = request.session_id
+            if request.audio_data and not self._awake.get(sid):
+                # Only run KWS when wakewords are configured. If wakewords is
+                # None or empty, the session is always awake and KWS is unnecessary.
+                if self.kws and self.wakewords:
+                    detected = self.kws.detect(request.audio_data)
+                    if detected:
+                        self._awake[sid] = True
+                        self._last_activity[sid] = time()
+                        logger.info(f"Session {sid} awakened by KWS: '{detected}'")
+                    else:
+                        if self.debug:
+                            logger.info("KWS: no wake word, skipping cloud STT")
+                        return
+
+            # ---- 2. STT --------------------------------------------------
             if request.text:
                 recognized = request.text
                 if self.debug:
@@ -346,7 +370,7 @@ class VoiceAssistant:
             request.text = recognized
             t_stt = time()  # T1: STT complete
 
-            # ---- 2. Context expiry check ---------------------------------
+            # ---- 3. Context expiry check ---------------------------------
             ctx_id = request.context_id
             if ctx_id:
                 age = self.llm.context_tracker.get_age(ctx_id)
@@ -354,7 +378,7 @@ class VoiceAssistant:
                     logger.info(f"Context {ctx_id} expired ({age:.0f}s), creating new")
                     request.context_id = None
 
-            # ---- 3. Awake check ------------------------------------------
+            # ---- 4. Awake check ------------------------------------------
             is_awake, just_woke = self._check_awake(request)
 
             # End word (skip if just woke up to avoid immediate exit)
@@ -367,12 +391,12 @@ class VoiceAssistant:
                     logger.info(f"Not awake, skipping")
                 return
 
-            # ---- 4. Context id -------------------------------------------
+            # ---- 5. Context id -------------------------------------------
             if not request.context_id:
                 request.context_id = str(uuid4())
                 logger.info(f"New context: {request.context_id}")
 
-            # ---- 5. Barge-in control -------------------------------------
+            # ---- 6. Barge-in control -------------------------------------
             prev = self._active_txn.get(request.session_id)
             if prev and prev != txn_id:
                 if not self._is_barge_in(recognized):
@@ -385,7 +409,7 @@ class VoiceAssistant:
                 logger.info(f"Start txn {txn_id}: '{request.text}'")
             self._active_txn[request.session_id] = txn_id
 
-            # ---- 6. Stop previous playback -------------------------------
+            # ---- 7. Stop previous playback -------------------------------
             await self.stop_response(request.session_id, request.context_id)
 
             yield STSResponse(
@@ -396,14 +420,14 @@ class VoiceAssistant:
                 metadata={"request_text": request.text},
             )
 
-            # ---- 7. LLM stream -------------------------------------------
+            # ---- 8. LLM stream -------------------------------------------
             await self._on_before_llm(request)
             llm_stream = self.llm.chat_stream(
                 request.context_id, request.user_id, request.text, request.files,
                 request.system_prompt_params,
             )
 
-            # ---- 8. TTS (inlined with LLM stream) ------------------------
+            # ---- 9. TTS (inlined with LLM stream) ------------------------
             t_llm_first = None  # T2: first LLM text token
             t_tts_first = None  # T3: first TTS audio
 
@@ -474,7 +498,7 @@ class VoiceAssistant:
                 )
                 first_chunk = False
 
-            # ---- 9. Performance report ------------------------------------
+            # ---- 10. Performance report -----------------------------------
             perf = {
                 "text": request.text or "",
                 "vad_to_stt_ms": round((t_stt - t_vad) * 1000),
@@ -486,7 +510,7 @@ class VoiceAssistant:
             }
             await self._on_performance(request, perf)
 
-            # ---- 10. Finalize ---------------------------------------------
+            # ---- 11. Finalize ---------------------------------------------
             self._interrupted_txn.discard(txn_id)
             if self._active_txn.get(request.session_id) == txn_id:
                 del self._active_txn[request.session_id]

@@ -1,0 +1,22 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "env": {
+                "OPENAI_API_KEY": "${env:OPENAI_API_KEY}",
+                "DASHSCOPE_API_KEY": "${env:DASHSCOPE_API_KEY}",
+                "OPENCLAW_API_KEY": "${env:OPENCLAW_API_KEY}",
+                "BAIDU_TTS_API_KEY": "${env:BAIDU_TTS_API_KEY}",
+                "BAIDU_TTS_SECRET_KEY": "${env:BAIDU_TTS_SECRET_KEY}"
+            }
+        }
+    ]
+}
