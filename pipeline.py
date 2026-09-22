@@ -5,18 +5,32 @@ barge-in interruption, and context timeout management.
 """
 
 import asyncio
+import contextlib
+import json
 import logging
 import os
 import traceback
 from time import time
-from typing import AsyncGenerator, Callable, Dict, List, Tuple
+from typing import AsyncGenerator, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-from .models import STSRequest, STSResponse
+from .delegate import DelegateManager
+from .models import LLMResponse, STSRequest, STSResponse
+from .tools import (
+    ASYNC_TOOL,
+    DELEGATE_SPEC,
+    GET_CURRENT_TIME_SPEC,
+    get_current_time,
+)
 from .vad import SpeechDetector, StandardSpeechDetector
 from .stt import AliyunASRSpeechRecognizer, SpeechRecognizer
-from .llm import LLMService, LLMResponse, NanobotWebSocketService
-from .tts import BaiduSpeechSynthesizer, CosyVoiceSpeechSynthesizer, SpeechSynthesizer
+from .llm import DeepSeekLLMService, LLMService
+from .tts import (
+    BaiduSpeechSynthesizer,
+    CosyVoiceSpeechSynthesizer,
+    EdgeTTSSpeechSynthesizer,
+    SpeechSynthesizer,
+)
 from .kws import KeywordWakeDetector
 
 logger = logging.getLogger(__name__)
@@ -55,13 +69,19 @@ class VoiceAssistant:
     tts_model:
         CosyVoice model name (default ``"cosyvoice-v3-flash"``).
     tts_provider:
-        TTS provider: ``"cosyvoice"`` (default) or ``"baidu"``.
-    nanobot_ws_url:
-        nanobot WebSocket endpoint (default ``ws://127.0.0.1:8765/``).
-    nanobot_token:
-        Shared secret for nanobot auth.
+        TTS provider: ``"cosyvoice"`` (default), ``"edge"`` (free edge-tts),
+        or ``"baidu"``.
+    llm_api_key:
+        LLM API key (defaults to ``DEEPSEEK_API_KEY`` env var).
+    llm_base_url:
+        OpenAI-compatible endpoint (default ``https://api.deepseek.com``).
+    llm_model:
+        Model name (default ``"deepseek-flash"``).
     llm_system_prompt:
-        System prompt prepended to each new chat.
+        System prompt sent with every request.
+    llm_thinking:
+        Enable the model's thinking mode (default False — voice turns want the
+        first token fast).
     vad_volume_threshold:
         VAD dB threshold (default -40).
     vad_silence_threshold:
@@ -103,12 +123,16 @@ class VoiceAssistant:
         tts_voice: str = "longanhuan",
         tts_model: str = "cosyvoice-v3-flash",
         tts_provider: str = "cosyvoice",
-        # LLM (nanobot)
+        tts_rate: Optional[str] = None,   # edge-tts rate, e.g. "+10%" (None = default)
+        tts_pitch: Optional[str] = None,  # edge-tts pitch, e.g. "+0Hz"
+        tts_volume: Optional[str] = None, # edge-tts volume, e.g. "+0%"
+        # LLM (direct OpenAI-compatible API)
         llm: LLMService = None,
-        nanobot_ws_url: str = "ws://127.0.0.1:8765/",
-        nanobot_token: str = "litests-shared-secret",
+        llm_api_key: str = None,
+        llm_base_url: str = "https://api.deepseek.com",
         llm_system_prompt: str = None,
-        llm_model: str = "deepseek-v4-flash",
+        llm_model: str = "deepseek-flash",
+        llm_thinking: bool = False,
         # VAD
         vad: SpeechDetector = None,
         vad_volume_threshold: float = -40.0,
@@ -123,6 +147,15 @@ class VoiceAssistant:
         context_timeout: float = 3600.0,
         # Barge-in
         barge_in_keywords: List[str] = None,
+        # Noise filter: duration + text based (Plan D)
+        noise_words: List[str] = None,
+        min_meaningful_duration: float = 1.0,
+        # Delegate (复杂任务委托, 走常驻中继插件)
+        delegate_url: str = "http://127.0.0.1:8765",
+        delegate_enabled: bool = True,
+        delegate_progress_after: float = 25.0,
+        delegate_progress_interval: float = 45.0,
+        cancel_words: List[str] = None,
         # Misc
         debug: bool = False,
     ):
@@ -163,15 +196,16 @@ class VoiceAssistant:
                 debug=debug,
             )
 
-        # --- LLM (nanobot) ------------------------------------------------
+        # --- LLM (direct API) ---------------------------------------------
         if llm:
             self.llm = llm
         else:
-            self.llm = NanobotWebSocketService(
-                ws_url=nanobot_ws_url,
-                token=nanobot_token,
+            self.llm = DeepSeekLLMService(
+                base_url=llm_base_url,
+                api_key=llm_api_key,
                 system_prompt=llm_system_prompt,
                 model=llm_model,
+                thinking=llm_thinking,
                 debug=debug,
             )
 
@@ -183,6 +217,14 @@ class VoiceAssistant:
                 api_key=tts_api_key,
                 model=tts_model,
                 voice=tts_voice,
+                debug=debug,
+            )
+        elif tts_provider == "edge":
+            self.tts = EdgeTTSSpeechSynthesizer(
+                voice=tts_voice,
+                rate=tts_rate or "+0%",
+                pitch=tts_pitch or "+0Hz",
+                volume=tts_volume or "+0%",
                 debug=debug,
             )
         else:
@@ -199,6 +241,37 @@ class VoiceAssistant:
         self.awake_timeout = awake_timeout
         self.context_timeout = context_timeout
         self.barge_in_keywords = barge_in_keywords or self.DEFAULT_BARGE_IN
+
+        # --- Noise filter ---------------------------------------------------
+        self.noise_words = set(noise_words or [])
+        self.min_meaningful_duration = min_meaningful_duration
+
+        # --- Tools ----------------------------------------------------------
+        # 同步工具(时间/天气/…)返回字符串 → 带着结果再问模型一次;
+        # 异步工具(delegate)返回 ASYNC_TOOL → 本轮结束, 结果以后台播报送达。
+        self.max_tool_rounds = 3
+        # 兜底确认话术: 工具调用轮里模型经常"只发工具不吐字"(实测 content 恒为 0),
+        # 于是用户要静等结果。仅当本轮一个字都没说时才补这一句, 不会和模型自己
+        # 说的话重复。
+        self.delegate_confirm_text = "好的，我去查一下，稍后告诉您。"
+        # 取消词: 用户说"别查了"时本地直接掐掉后台任务, 不用过 LLM(零延迟又准)
+        self.cancel_words = cancel_words if cancel_words is not None else [
+            "别查了", "不用查了", "不查了", "停止查询", "取消查询", "别查",
+        ]
+        # --- 复杂任务委托(常驻中继) -----------------------------------------
+        self.delegate = DelegateManager(
+            base_url=delegate_url,
+            announce=self.announce,
+            is_idle=self._is_idle,
+            remember=self.remember_from_background,
+            enabled=delegate_enabled,
+            progress_after=delegate_progress_after,
+            progress_interval=delegate_progress_interval,
+            debug=debug,
+        )
+        self._pending_announcements: List[Tuple[str, str]] = []
+        self._announce_task: Optional[asyncio.Task] = None
+        self._register_default_tools()
 
         self._awake: Dict[str, bool] = {}
         self._last_activity: Dict[str, float] = {}
@@ -263,6 +336,7 @@ class VoiceAssistant:
         sid = req.session_id
         if self._pending_end.pop(sid, False):
             self._awake[sid] = False
+            self._kws_reset(sid)
             logger.info(f"Session {sid} awake ended by end word")
 
     async def _default_performance(self, req: STSRequest, metrics: dict):
@@ -274,6 +348,127 @@ class VoiceAssistant:
             f"TOTAL {metrics.get('vad_to_tts_first_ms', '?')}ms",
         ]
         logger.info(f"[PERF] \"{metrics.get('text', '')[:30]}\" | {' | '.join(parts)}")
+
+    # ==================================================================
+    # Tools
+    # ==================================================================
+
+    def _register_default_tools(self):
+        """注册内置工具(时间 + 复杂任务委托)。"""
+        self.llm.add_tool("get_current_time", GET_CURRENT_TIME_SPEC, get_current_time)
+        self.llm.add_tool("delegate_to_dsh", DELEGATE_SPEC, self._delegate_tool)
+
+    async def _delegate_tool(self, task: str, metadata: dict = None):
+        """复杂任务委托：交给常驻中继（qqbot profile 内的受限 dsh agent）异步执行。
+
+        提交后**立即**返回 :data:`ASYNC_TOOL`，本轮到此结束 —— 结果由
+        :class:`~voice_assistant.delegate.DelegateManager` 在后台轮询并按策略播报。
+        提交失败时返回一段文本，让模型正常回话（比静默失败好）。
+        """
+        meta = metadata or {}
+        session_id = meta.get("session_id")
+        task_id = await self.delegate.submit(task, session_id, meta.get("context_id"))
+        if not task_id:
+            return "(委托服务当前不可用，请告诉用户稍后再试)"
+        logger.info(f"[delegate] {task_id} 受理: {task[:60]}")
+        return ASYNC_TOOL
+
+    async def remember_from_background(self, context_id: str, text: str):
+        """把后台播报出去的结论写进对话历史。
+
+        否则用户听到结果后再问"刚才那个结果是多少"，前端模型会说"我还没收到结果"
+        （实测确认过），体验上等于助手失忆。**进度播报不写** —— 只有最终结论值得记。
+        """
+        if not context_id or not text:
+            return
+        await self.llm.append_turn(context_id, None, text)
+        logger.info(f"[delegate] 结论已写入历史: {text[:40]}")
+
+    def _is_idle(self, session_id: str = None) -> bool:
+        """现在适合开口吗？
+
+        三个条件都必须满足: 没有进行中的用户轮次、扬声器没在放音、VAD 没在录音。
+        录音中绝不能开口 —— 回声抑制会把 VAD 静音, 用户正在说的那句话会被截断。
+        """
+        return not (
+            self._active_txn.get(session_id)
+            or self.vad.should_mute()
+            or self.vad.is_recording(session_id)
+        )
+
+    async def announce(self, text: str, session_id: str = None):
+        """主动播报一句：空闲就直接说，忙就排队（由常驻 worker 在空闲时播）。"""
+        if not text:
+            return
+        if not self._is_idle(session_id):
+            if (session_id, text) not in self._pending_announcements:
+                logger.info(f"[announce] 会话忙, 排队等空闲: {text[:30]}")
+                self._pending_announcements.append((session_id, text))
+            return
+        await self._speak(text, session_id)
+
+    async def _speak(self, text: str, session_id: str = None):
+        """真正开口（流式合成 → 交给播放层）。"""
+        logger.info(f"[announce] 播报: {text[:40]}")
+        first = True
+        async for audio in self.tts.synthesize_stream(text):
+            await self.handle_response(STSResponse(
+                type="chunk", session_id=session_id, audio_data=audio,
+                metadata={"is_first_chunk": first, "sample_rate": self.tts.sample_rate,
+                          "source": "announce"},
+            ))
+            first = False
+        await self.handle_response(STSResponse(type="final", session_id=session_id))
+
+    async def _announce_worker(self, interval: float = 0.5):
+        """常驻播报调度：每 0.5s 看一次排队内容，空闲了就播。
+
+        之前用"被挡下就 schedule 一次重试"的写法，有**重入 bug**：重试任务自己
+        调 flush → 仍忙 → 再调 schedule，而此刻 _announce_retry 就是这个正在运行的
+        任务（not done()）→ 直接 return → 重试链断掉，那条播报**永久丢失**。
+        改成单 worker 轮询后，不存在这条自引用路径。
+        """
+        while True:
+            await asyncio.sleep(interval)
+            if not self._pending_announcements:
+                continue
+            sid, text = self._pending_announcements[0]
+            if not self._is_idle(sid):
+                continue
+            self._pending_announcements.pop(0)
+            try:
+                await self._speak(text, sid)
+            except Exception as ex:                               # noqa: BLE001
+                logger.error(f"播报失败: {ex}")
+
+    def flush_announcements(self, session_id: str = None):
+        """保留的兼容入口：worker 会自己轮询，这里无需做事（但仍记一条便于排查）。"""
+        if self._pending_announcements:
+            logger.info(f"[announce] 待播报 {len(self._pending_announcements)} 条, 等空闲")
+
+    # ==================================================================
+    # Audio entry point
+    # ==================================================================
+
+    async def feed_audio(self, samples: bytes, session_id: str):
+        """麦克风原始音频的唯一入口: 先喂流式 KWS(边收边判唤醒词), 再喂 VAD(切句)。
+
+        流式 KWS 让唤醒判定跟着音频走 —— 等 VAD 切出句子时唤醒状态早就定了,
+        对话链路上不再有 KWS 的整段解码(原来 0.7~1.5s)那段开销。
+        """
+        if self.kws and self.wakewords and not self._awake.get(session_id):
+            self.kws.feed(session_id, samples)
+            hit = self.kws.poll(session_id)
+            if hit:
+                self._awake[session_id] = True
+                self._last_activity[session_id] = time()
+                logger.info(f"Session {session_id} awakened by KWS: '{hit}'")
+        await self.vad.process_samples(samples, session_id)
+
+    def _kws_reset(self, session_id: str):
+        """会话睡回去时丢掉 KWS 流式状态, 免得残留上下文干扰下一次唤醒。"""
+        if self.kws is not None and hasattr(self.kws, "reset_stream"):
+            self.kws.reset_stream(session_id)
 
     # ==================================================================
     # Awake state logic
@@ -291,6 +486,7 @@ class VoiceAssistant:
                 return True, False
             # Timed out
             self._awake[sid] = False
+            self._kws_reset(sid)
             logger.info(f"Session {sid} awake timed out")
 
         # No wake words → always awake
@@ -310,8 +506,52 @@ class VoiceAssistant:
 
         return False, False
 
+    #: 疑问句结尾标记：这些结尾说明用户在**提问**，不是在下"结束"指令
+    QUESTION_TAILS = ("吗", "呢", "么", "嘛", "?", "？")
+
     def _has_end_word(self, text: str) -> bool:
-        return any(ew in text for ew in self.end_words)
+        """判断是否是"结束/退下"指令。
+
+        历史：原先用 `any(ew in text ...)` 配一份含"好了/行了/了解/收到"等日常词的
+        大词表，结果「天气查好了吗？」被判成结束语 → 助手静默回到待唤醒态，用户以为
+        程序退出（见 bt_assistant/混合路由规划.md Phase E1）。
+
+        修法**两头一起收干净**：
+          * 词表侧：run.py 的 END_WORDS 只留"本义就是停止/离开"的说法，歧义日常词
+            全部剔除并注明原因（防止有人再加回来）；
+          * 逻辑侧：只留一条守卫 —— **疑问句不算**。
+
+        因此那套"按词长分层（整句/句首/句尾）"的复杂匹配已无必要：**歧义来自词表，
+        不来自匹配方式**。现在就是最简单的子串匹配 + 疑问句守卫。
+        """
+        raw = (text or "").strip()
+        if not raw or not self.end_words:
+            return False
+        if raw.endswith(self.QUESTION_TAILS):
+            return False
+        return any(ew in raw for ew in self.end_words)
+
+    def _match_cancel_word(self, text: str) -> bool:
+        """是否命中"取消后台查询"的本地词表。"""
+        if not text or not self.cancel_words:
+            return False
+        cleaned = text.strip()
+        return any(cw in cleaned for cw in self.cancel_words)
+
+    def _is_noise(self, text: str, audio_duration: float) -> bool:
+        """Check if short-duration input with noise-only text should be ignored.
+
+        Plan D: combine duration + text.  If the audio segment is shorter than
+        *min_meaningful_duration* AND the recognized text consists entirely of
+        noise/filler words (e.g. "嗯", "对", "哦"), treat it as non-input.
+
+        Short segments with meaningful content (e.g. "退下吧" at 0.51s) are
+        NOT filtered — only the noise-word check triggers.
+        """
+        if not self.noise_words or audio_duration >= self.min_meaningful_duration:
+            return False
+        cleaned = text.strip().rstrip("。，！？.!?…~～, ")
+        return cleaned in self.noise_words
 
     def _is_barge_in(self, text: str) -> bool:
         """Check if *text* starts with an explicit interruption keyword."""
@@ -333,23 +573,35 @@ class VoiceAssistant:
             txn_id = str(uuid4())
             t_vad = time()  # T0: VAD silence confirmed → invoke starts
 
-            # ---- 1. KWS pre-check (local, before cloud STT) ---------------
-            # If the session is not awake and we have a local KWS model,
-            # run it first to avoid paying for cloud STT on non-wake-word audio.
+            # ---- 1. KWS pre-check ----------------------------------------
+            # 正常路径: 音频是经 feed_audio() 进来的, 流式 KWS 已经边收边判过唤醒词,
+            # 这里只需要看状态 —— 没唤醒就直接丢, 不再做任何解码。
+            # 只有调用方绕过了 feed_audio()(直接喂 vad.process_samples)时, 才退回
+            # 整段批量判一次, 免得永远醒不过来。
             sid = request.session_id
             if request.audio_data and not self._awake.get(sid):
                 # Only run KWS when wakewords are configured. If wakewords is
                 # None or empty, the session is always awake and KWS is unnecessary.
                 if self.kws and self.wakewords:
-                    detected = self.kws.detect(request.audio_data)
-                    if detected:
+                    hit = self.kws.poll(sid)
+                    if hit:
                         self._awake[sid] = True
                         self._last_activity[sid] = time()
-                        logger.info(f"Session {sid} awakened by KWS: '{detected}'")
-                    else:
+                        logger.info(f"Session {sid} awakened by KWS: '{hit}'")
+                    elif self.kws.has_stream(sid):
                         if self.debug:
-                            logger.info("KWS: no wake word, skipping cloud STT")
+                            logger.info("KWS(streaming): no wake word, skipping cloud STT")
                         return
+                    else:
+                        detected = await asyncio.to_thread(self.kws.detect, request.audio_data)
+                        if detected:
+                            self._awake[sid] = True
+                            self._last_activity[sid] = time()
+                            logger.info(f"Session {sid} awakened by KWS: '{detected}'")
+                        else:
+                            if self.debug:
+                                logger.info("KWS: no wake word, skipping cloud STT")
+                            return
 
             # ---- 2. STT --------------------------------------------------
             if request.text:
@@ -391,7 +643,39 @@ class VoiceAssistant:
                     logger.info(f"Not awake, skipping")
                 return
 
-            # ---- 5. Context id -------------------------------------------
+            # ---- 4.5. Noise filter (duration + text) -----------------------
+            if self._is_noise(recognized, request.audio_duration):
+                logger.info(
+                    f"Noise filtered: '{recognized}' ({request.audio_duration:.2f}s)"
+                )
+                return
+
+            # ---- 5. 取消委托(本地判定, 零延迟) ---------------------------
+            # 用户说"别查了/停止查询"时直接掐掉后台任务, 不必绕一圈 LLM。
+            cancelled = self._match_cancel_word(recognized)
+            if cancelled:
+                task_id = self.delegate.cancel(request.session_id)
+                if task_id:
+                    logger.info(f"用户取消委托 {task_id}: '{recognized}'")
+                    request.context_id = request.context_id or str(uuid4())
+                    yield STSResponse(
+                        type="start", session_id=request.session_id,
+                        user_id=request.user_id, context_id=request.context_id,
+                        metadata={"request_text": request.text},
+                    )
+                    await self.announce("好，不查了。", request.session_id)
+                    final = STSResponse(
+                        type="final", session_id=request.session_id,
+                        user_id=request.user_id, context_id=request.context_id,
+                        text="好，不查了。",
+                    )
+                    await self._on_finish(request, final)
+                    yield final
+                    return
+                if self.debug:
+                    logger.info("取消词命中, 但没有在跑的后台任务")
+
+            # ---- 5.5. Context id -----------------------------------------
             if not request.context_id:
                 request.context_id = str(uuid4())
                 logger.info(f"New context: {request.context_id}")
@@ -420,89 +704,208 @@ class VoiceAssistant:
                 metadata={"request_text": request.text},
             )
 
-            # ---- 8. LLM stream -------------------------------------------
+            # ---- 8. LLM stream (含工具轮次循环) ---------------------------
+            # 一轮用户输入可能触发多次 LLM 请求: 模型发 tool_call → 本地执行 →
+            # 带着结果再问一次。轮内消息(assistant.tool_calls + tool 结果)只在本轮
+            # 请求里携带, **不落历史** —— 历史由本轮结束时 append_turn 统一写一次,
+            # 保证里面永远是干净的 user/assistant 成对消息(否则历史裁剪一旦拆散
+            # tool_calls 与它的结果, 下一轮请求就会因"孤儿 tool 消息"报 400)。
             await self._on_before_llm(request)
-            llm_stream = self.llm.chat_stream(
-                request.context_id, request.user_id, request.text, request.files,
-                request.system_prompt_params,
-            )
 
-            # ---- 9. TTS (inlined with LLM stream) ------------------------
+            # ---- 9. TTS (runs in parallel with the LLM stream) ------------
+            # The LLM stream fills a bounded queue with sentence-sized chunks;
+            # a consumer task synthesizes them in order.  Keeping synthesis out
+            # of the LLM loop means we keep pulling tokens while TTS works.
             t_llm_first = None  # T2: first LLM text token
+            t_llm_request = None  # T2-: HTTP 请求真正发出的时刻
+            t_llm_token = None  # T2a: 首个 token(可能还没到句末, 不能合成)
             t_tts_first = None  # T3: first TTS audio
-
-            async def synthesize():
-                nonlocal t_llm_first, t_tts_first
-                voice_text = ""
-                language = None
-                async for chunk in llm_stream:
-                    if not self._is_active(request.session_id, txn_id):
-                        if self.debug:
-                            logger.info(f"LLM stream broken: new txn {self._active_txn.get(request.session_id)}")
-                        break
-
-                    # Skip tool calls (nanobot handles them server-side)
-                    if chunk.tool_call:
-                        yield None, chunk
-                        continue
-
-                    if t_llm_first is None:
-                        t_llm_first = time()  # T2: first LLM text chunk
-
-                    if chunk.voice_text:
-                        voice_text += chunk.voice_text
-                        if not language:
-                            await self._on_before_tts(request)
-
-                    audio = await self.tts.synthesize(
-                        text=chunk.voice_text,
-                        language=language,
-                    )
-                    if t_tts_first is None and audio:
-                        t_tts_first = time()  # T3: first TTS audio generated
-
-                    yield audio, chunk
-                return
-
+            t_first_queued = None  # T4: first audio handed to the speaker
             response_text = ""
             first_chunk = True
-            t_first_queued = None  # T4: first audio enqueued for playback
-            async for audio, llm_chunk in synthesize():
-                if not self._is_active(request.session_id, txn_id):
-                    break
+            tts_started = False
+            sentence_q: asyncio.Queue = asyncio.Queue(maxsize=4)
+            DONE = object()
+            round_messages: List[Dict] = []
+            called_tools: List[str] = []      # 本轮调过的工具(用于按路径分类时延)
 
-                if llm_chunk.tool_call:
-                    yield STSResponse(
-                        type="tool_call",
-                        session_id=request.session_id,
-                        user_id=request.user_id,
-                        context_id=llm_chunk.context_id,
-                        tool_call=llm_chunk.tool_call,
-                    )
-                    continue
+            def _note_first_token():
+                """LLM 层首个 token 到达(此时可能还没到句末标点, 合成还开不了口)。"""
+                nonlocal t_llm_token
+                if t_llm_token is None:
+                    t_llm_token = time()
 
-                response_text += llm_chunk.text or ""
+            def _note_request_start():
+                """HTTP 请求真正发出 —— 与 t_stt 之间的差值就是"请求前的本地开销"
+                (停上一轮播放/拆音频流、组 prompt、事件循环调度等)。"""
+                nonlocal t_llm_request
+                if t_llm_request is None:
+                    t_llm_request = time()
 
-                if t_first_queued is None and audio:
-                    t_first_queued = time()  # T4: first audio ready for playback
+            self.llm.on_first_token = _note_first_token
+            self.llm.on_request_start = _note_request_start
 
-                yield STSResponse(
-                    type="chunk",
-                    session_id=request.session_id,
-                    user_id=request.user_id,
-                    context_id=llm_chunk.context_id,
-                    text=llm_chunk.text,
-                    voice_text=llm_chunk.voice_text,
-                    audio_data=audio,
-                    metadata={"is_first_chunk": first_chunk},
-                )
-                first_chunk = False
+            async def produce():
+                """LLM → 切句 → 队列(不在这里合成)。工具轮次循环也在这里。"""
+                nonlocal t_llm_first
+                try:
+                    for _round in range(self.max_tool_rounds + 1):
+                        stream = self.llm.chat_stream(
+                            request.context_id, request.user_id, request.text, request.files,
+                            request.system_prompt_params,
+                            extra_messages=round_messages or None,
+                            persist=False,
+                        )
+                        tool_hit = None
+                        round_spoke = False
+                        async for chunk in stream:
+                            if not self._is_active(request.session_id, txn_id):
+                                if self.debug:
+                                    logger.info(
+                                        f"LLM stream broken: new txn "
+                                        f"{self._active_txn.get(request.session_id)}"
+                                    )
+                                return
+                            if t_llm_first is None:
+                                t_llm_first = time()  # T2: first LLM text chunk
+                            if chunk.tool_call:
+                                tool_hit = chunk.tool_call
+                                await sentence_q.put(chunk)
+                                continue
+                            if chunk.voice_text:
+                                round_spoke = True
+                                await sentence_q.put(chunk)
+
+                        if tool_hit is None:
+                            return
+
+                        logger.info(f"Tool call: {tool_hit.name}({tool_hit.arguments})")
+                        called_tools.append(tool_hit.name)
+                        try:
+                            result = await self.llm.execute_tool(
+                                tool_hit.name, dict(tool_hit.arguments or {}),
+                                metadata={"session_id": request.session_id,
+                                          "context_id": request.context_id},
+                            )
+                        except Exception as ex:                       # noqa: BLE001
+                            logger.error(f"工具 {tool_hit.name} 执行失败: {ex}")
+                            result = f"(工具执行失败: {ex})"
+
+                        if result is ASYNC_TOOL:
+                            # 委托类工具: 本轮到此结束, 结果以后台播报送达。
+                            if not round_spoke:
+                                # 模型一个字都没说 → 补一句兜底确认话术, 否则用户
+                                # 会在结果回来前一直听不到任何声音。
+                                logger.info("工具轮无文本输出 → 补兜底确认话术")
+                                await sentence_q.put(LLMResponse(
+                                    context_id=request.context_id,
+                                    text=self.delegate_confirm_text,
+                                    voice_text=self.delegate_confirm_text,
+                                ))
+                            if self.debug:
+                                logger.info("异步委托已受理 → 本轮结束, 结果后台播报")
+                            return
+
+                        round_messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": tool_hit.id or "call_0",
+                                "type": "function",
+                                "function": {"name": tool_hit.name,
+                                             "arguments": json.dumps(tool_hit.arguments or {},
+                                                                     ensure_ascii=False)},
+                            }],
+                        })
+                        round_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_hit.id or "call_0",
+                            "content": str(result),
+                        })
+                    logger.warning(f"工具轮次超过上限 {self.max_tool_rounds}, 强制结束当前轮")
+                finally:
+                    await sentence_q.put(DONE)
+
+            producer = asyncio.create_task(produce())
+            try:
+                while True:
+                    llm_chunk = await sentence_q.get()
+                    if llm_chunk is DONE:
+                        break
+                    if not self._is_active(request.session_id, txn_id):
+                        break
+
+                    if llm_chunk.tool_call:
+                        yield STSResponse(
+                            type="tool_call",
+                            session_id=request.session_id,
+                            user_id=request.user_id,
+                            context_id=llm_chunk.context_id,
+                            tool_call=llm_chunk.tool_call,
+                        )
+                        continue
+
+                    response_text += llm_chunk.text or ""
+
+                    if not tts_started:
+                        tts_started = True
+                        await self._on_before_tts(request)
+
+                    # 流式合成: 首个音频包一到就交给扬声器, 不等整句
+                    async for audio in self.tts.synthesize_stream(llm_chunk.voice_text):
+                        if not self._is_active(request.session_id, txn_id):
+                            break
+                        if t_tts_first is None:
+                            t_tts_first = time()  # T3: first TTS audio generated
+                        if t_first_queued is None:
+                            t_first_queued = time()  # T4: first audio ready to play
+
+                        yield STSResponse(
+                            type="chunk",
+                            session_id=request.session_id,
+                            user_id=request.user_id,
+                            context_id=llm_chunk.context_id,
+                            text=llm_chunk.text,
+                            voice_text=llm_chunk.voice_text,
+                            audio_data=audio,
+                            metadata={
+                                "is_first_chunk": first_chunk,
+                                "sample_rate": self.tts.sample_rate,
+                            },
+                        )
+                        first_chunk = False
+            finally:
+                # 收尾 producer: 被中断就取消; 正常结束时 await 它,
+                # 好让 LLM 的异常(如 401)在这里抛出、走 invoke 的错误分支,
+                # 而不是变成 "Task exception was never retrieved"。
+                if not producer.done():
+                    producer.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await producer
+                # 本轮音频结束由末尾的 type="final" 通知播放层(见 adapter)
+
+            # ---- 9.5 落历史(整轮只写一次, 不含工具管道消息) ----------------
+            if response_text:
+                await self.llm.append_turn(request.context_id, request.text, response_text)
 
             # ---- 10. Performance report -----------------------------------
+            # 路径分类: 复杂路径看的是"提问→**确认话术**出声"; 最终答案属异步播报, 不计入。
+            if "delegate_to_dsh" in called_tools:
+                path = "delegate"
+            elif called_tools:
+                path = "tool"
+            else:
+                path = "chat"
             perf = {
                 "text": request.text or "",
+                "path": path,
+                "tools": called_tools,
                 "vad_to_stt_ms": round((t_stt - t_vad) * 1000),
+                "stt_to_llm_request_ms": round((t_llm_request - t_stt) * 1000) if t_llm_request else None,
+                "llm_request_to_token_ms": round((t_llm_token - t_llm_request) * 1000) if (t_llm_request and t_llm_token) else None,
+                "stt_to_llm_token_ms": round((t_llm_token - t_stt) * 1000) if t_llm_token else None,
                 "stt_to_llm_first_ms": round((t_llm_first - t_stt) * 1000) if t_llm_first else None,
+                "llm_token_to_sentence_ms": round((t_llm_first - t_llm_token) * 1000) if (t_llm_token and t_llm_first) else None,
                 "llm_first_to_tts_first_ms": round((t_tts_first - t_llm_first) * 1000) if (t_llm_first and t_tts_first) else None,
                 "tts_first_to_first_queued_ms": round((t_first_queued - t_tts_first) * 1000) if (t_tts_first and t_first_queued) else None,
                 "vad_to_tts_first_ms": round((t_tts_first - t_vad) * 1000) if t_tts_first else None,
@@ -525,16 +928,21 @@ class VoiceAssistant:
             await self._on_finish(request, final)
             yield final
 
+            # 本轮结束后看看有没有攒着的主动播报(空闲才播, 否则自己排下一次)
+            self.flush_announcements(request.session_id)
+
         except Exception as ex:
             tb = traceback.format_exc()
             logger.error(f"Pipeline error: {ex}\n{tb}")
-            yield STSResponse(
+            failed = STSResponse(
                 type="final",
                 session_id=request.session_id,
                 user_id=request.user_id,
                 context_id=request.context_id,
                 metadata={"error": str(ex) if self.debug else "Pipeline error"},
             )
+            await self._on_finish(request, failed)
+            yield failed
 
     # ==================================================================
     # Helpers
@@ -563,6 +971,26 @@ class VoiceAssistant:
 
     async def finalize(self, context_id: str):
         await self.vad.finalize_session(context_id)
+        self._kws_reset(context_id)
+
+    async def warmup(self):
+        """启动预热: 提前建好 LLM 的 httpx/SSL 上下文和 TTS 连接。
+
+        这些一次性开销(建 SSL 上下文约 1s, TTS 首次建 websocket 约 0.3~0.5s)
+        如果留到第一轮对话里, 就直接变成首字延时 —— 所以启动时先跑一遍。
+        """
+        await self.llm.warmup()
+        await self.tts.warmup()
+        # 常驻播报调度(必须在事件循环里启动): 排队内容等空闲自动播出
+        if self._announce_task is None or self._announce_task.done():
+            self._announce_task = asyncio.create_task(self._announce_worker())
 
     async def shutdown(self):
+        if self._announce_task is not None:
+            self._announce_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._announce_task
+            self._announce_task = None
+        await self.delegate.close()
         await self.llm.shutdown()
+        await self.tts.close()

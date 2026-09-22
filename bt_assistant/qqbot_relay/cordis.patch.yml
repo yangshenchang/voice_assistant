@@ -1,0 +1,25 @@
+# dsh-qqbot-relay bundle patch
+#
+# 由 `dsh plugin --profile qqbot add <本包路径>` 安装后，dsh 启动时自动加载。
+# 叠放顺序: dsh-base → dsh-qqbot bundle → 本 bundle → profile cordis.patch.yml
+#
+# 配置项(可在 profile 的 cordis.patch.yml 里按 id 覆盖):
+#   port / host        HTTP 控制面监听地址(默认 127.0.0.1:8765，仅本机可访问)
+#   allowedTools       交给 dsh agent 的工具白名单(其余工具对它从 prompt 消失且拒绝执行)
+#   qqAppId/qqAppSecret/openid  主动推送凭据与目标；openid 留空则只记账不推送
+- insert:
+    - id: qqbot-relay
+      name: 'dsh-qqbot-relay'
+      config:
+        host: 127.0.0.1
+        port: 8765
+        # 只放行"查"的能力: 联网检索 + 只读文件/搜索。
+        # 刻意不给 write/edit/str_replace_editor/pwsh/bash —— 语音误路由不能变成语音直通 shell。
+        allowedTools:
+          - web_search
+          - web_fetch
+          - read
+          - glob
+          - grep
+        pushFullResult: true
+        taskTimeoutMs: 600000

@@ -39,6 +39,14 @@ class SpeechDetector(ABC):
     async def finalize_session(self, session_id: str):
         """Clean up a session."""
 
+    def is_recording(self, session_id: str = None) -> bool:
+        """该会话当前是否正在录音(有未判句的语音)。
+
+        供"主动播报"判断时机用: 正在录音时绝不能开口 —— 否则回声抑制会把
+        VAD 静音, 用户正在说的那句话会被截断。
+        """
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Standard amplitude-threshold detector
@@ -187,6 +195,10 @@ class StandardSpeechDetector(SpeechDetector):
 
     async def finalize_session(self, session_id: str):
         self._sessions.pop(session_id, None)
+
+    def is_recording(self, session_id: str = None) -> bool:
+        s = self._sessions.get(session_id)
+        return bool(s and s.is_recording)
 
     # -- session helpers ---------------------------------------------------
 

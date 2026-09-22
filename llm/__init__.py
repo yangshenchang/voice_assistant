@@ -1,20 +1,42 @@
-"""LLM service abstractions and the nanobot WebSocket client."""
+"""LLM service abstractions and a direct OpenAI-compatible streaming client."""
 
 import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator, Callable, Dict, List, Optional
 
-import websockets
-from websockets.exceptions import ConnectionClosed
+import httpx
 
 from ..context_manager import ContextTracker
 from ..models import LLMResponse, ToolCall
 
 logger = logging.getLogger(__name__)
+
+# Emoji ranges that would be vocalized by TTS as their names (e.g. 🐈 → "猫",
+# 🇨🇳 → flag name). Stripped before synthesis. Includes regional indicators
+# (flags), emoticons, pictographs, dingbats, and the FE0F variation selector.
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001F5FF"  # Symbols & pictographs
+    "\U0001F600-\U0001F64F"  # Emoticons
+    "\U0001F680-\U0001F6FF"  # Transport & map symbols
+    "\U0001F700-\U0001F77F"  # Alchemical symbols
+    "\U0001F780-\U0001F7FF"  # Geometric shapes extended
+    "\U0001F800-\U0001F8FF"  # Supplemental arrows
+    "\U0001F900-\U0001F9FF"  # Supplemental symbols & pictographs
+    "\U0001FA00-\U0001FA6F"  # Chess symbols
+    "\U0001FA70-\U0001FAFF"  # Symbols & pictographs extended-A
+    "\U0001F1E6-\U0001F1FF"  # Regional indicators (flags)
+    "\U00002702-\U000027B0"  # Dingbats
+    "\U00002600-\U000026FF"  # Misc symbols
+    "\U00002B00-\U00002BFF"  # Misc symbols and arrows
+    "\U0000FE0F"             # Variation selector-16
+    "]+"
+)
 
 
 # ========================================================================
@@ -86,6 +108,10 @@ class LLMService(ABC):
         # Hooks
         self._request_filter: Callable = lambda text: text
         self._on_before_tool_calls: Callable = self._default_before_tool_calls
+        #: 首个 token 到达时回调（用来区分"模型开口慢"与"第一个句子边界来得晚"）
+        self.on_first_token: Optional[Callable[[], None]] = None
+        #: 真正发出 HTTP 请求时回调（用来区分"请求前的本地开销"与"网络+模型耗时"）
+        self.on_request_start: Optional[Callable[[], None]] = None
 
     # -- decorators -------------------------------------------------------
 
@@ -124,11 +150,45 @@ class LLMService(ABC):
 
     # -- tool execution ---------------------------------------------------
 
+    def add_tool(self, name: str, spec: Dict, func: Callable, instruction: str = None) -> Tool:
+        """注册一个可供模型调用的工具。
+
+        *spec* 是 OpenAI 工具描述(``{"type":"function","function":{...}}``),
+        会随每次请求一起发给模型; *func* 是异步或同步实现, 通过
+        :meth:`execute_tool` 调用。
+        """
+        tool = Tool(name=name, spec=spec, func=func, instruction=instruction)
+        self.tools[name] = tool
+        return tool
+
     async def execute_tool(self, name: str, arguments: dict, metadata: dict = None):
         tool = self.tools[name]
         if "metadata" in inspect.signature(tool.func).parameters:
             arguments["metadata"] = metadata
-        return await tool.func(**arguments)
+        result = tool.func(**arguments)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    async def append_turn(self, context_id: str, user_text: str, assistant_text: str):
+        """把一轮对话(用户输入 + 助手回复)落进历史。
+
+        多轮工具调用时, ``chat_stream(persist=False)`` 不会自己落历史
+        (否则每轮都会写一条, 且会把 tool 管道消息带进历史), 由上层在本轮真正
+        结束时调一次这里, 保证历史里始终是干净的 ``user`` / ``assistant`` 成对消息。
+        """
+        if not user_text and not assistant_text:
+            return
+        messages = [{"role": "user", "content": user_text}] if user_text else []
+        await self.update_context(context_id, messages, assistant_text)
+
+    # -- lifecycle ---------------------------------------------------------
+
+    async def warmup(self):
+        """启动预热钩子(建连接/SSL 上下文等)。默认不做任何事。"""
+
+    async def shutdown(self):
+        """释放资源。默认不做任何事。"""
 
     # -- main streaming entry point ---------------------------------------
 
@@ -139,16 +199,30 @@ class LLMService(ABC):
         text: str,
         files: List[Dict] = None,
         system_prompt_params: Dict = None,
+        extra_messages: List[Dict] = None,
+        persist: bool = True,
     ) -> AsyncGenerator[LLMResponse, None]:
-        """High-level streaming entry point with text splitting & voice extraction."""
+        """High-level streaming entry point with text splitting & voice extraction.
+
+        Parameters
+        ----------
+        extra_messages:
+            只在本轮请求里追加的消息(工具轮次: ``assistant.tool_calls`` +
+            ``role:"tool"`` 结果)。不写进历史。
+        persist:
+            False 表示本轮结束不落历史 —— 多轮工具调用时由上层在本轮真正结束时
+            调 :meth:`append_turn` 统一落一次。
+        """
         logger.info(f"User: {text}")
         text = self._request_filter(text)
 
-        if not text and not files:
+        if not text and not files and not extra_messages:
             return
 
-        messages = await self.compose_messages(context_id, text, files, system_prompt_params)
-        msg_count_start = len(messages) - 1
+        extra_messages = extra_messages or []
+        messages = await self.compose_messages(context_id, text, files, system_prompt_params,
+                                              extra_messages)
+        user_msg_index = len(messages) - 1 - len(extra_messages)
 
         stream_buffer = ""
         response_text = ""
@@ -178,6 +252,13 @@ class LLMService(ABC):
 
         async for chunk in self.get_llm_stream_response(context_id, user_id, messages, system_prompt_params):
             if chunk.tool_call:
+                # 工具调用前若还有没吐完的文本(如确认话术), 必须先切出去 ——
+                # 否则这句话会一直压在 buffer 里, 直到工具跑完才出声。
+                if stream_buffer.strip():
+                    voice = extract_voice(stream_buffer)
+                    yield LLMResponse(context_id, stream_buffer, voice)
+                    response_text += stream_buffer
+                    stream_buffer = ""
                 yield chunk
                 continue
 
@@ -206,12 +287,8 @@ class LLMService(ABC):
             response_text += stream_buffer
 
         logger.info(f"AI: {response_text}")
-        if len(messages) > msg_count_start:
-            await self.update_context(
-                context_id,
-                messages[msg_count_start - len(messages):],
-                response_text,
-            )
+        if persist and 0 <= user_msg_index < len(messages):
+            await self.update_context(context_id, [messages[user_msg_index]], response_text)
 
     # -- helpers ----------------------------------------------------------
 
@@ -220,37 +297,87 @@ class LLMService(ABC):
 
     @staticmethod
     def _remove_control_tags(text: str) -> str:
-        return re.sub(r"\[(\w+):([^\]]+)\]", "", text).strip()
+        text = re.sub(r"\[(\w+):([^\]]+)\]", "", text)
+        return LLMService._clean_for_tts(text)
+
+    @staticmethod
+    def _clean_for_tts(text: str) -> str:
+        """Strip markdown / emoji / list formatting so TTS won't read it aloud.
+
+        Only markers that would be vocalized as garbage (bold asterisks, list
+        dashes, emoji names, URLs) are removed — the spoken content itself is
+        preserved. E.g. ``**多云**🌦️`` → ``多云``. Sentence boundaries (``。``,
+        line breaks) are kept so TTS still gets natural pauses.
+        """
+        if not text:
+            return text
+
+        # Inline markdown emphasis / code / links → keep inner content
+        t = re.sub(r"\*\*(.+?)\*\*", r"\1", text)          # **bold**
+        t = re.sub(r"\*{2,}", "", t)                       # stray **
+        t = re.sub(r"`([^`]+)`", r"\1", t)                 # `code`
+        t = re.sub(r"~~(.+?)~~", r"\1", t)                 # ~~strike~~
+        t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)     # [text](url)
+
+        # Line-level formatting markers
+        t = re.sub(r"^[ \t]{0,3}#{1,6}[ \t]*", "", t, flags=re.M)   # headings
+        t = re.sub(r"^[ \t]*[-*+][ \t]+", "", t, flags=re.M)        # bullets
+        t = re.sub(r"^[ \t]*\d{1,3}[.、)][ \t]+", "", t, flags=re.M)  # numbered lists
+        t = re.sub(r"^[ \t]*>[ \t]?", "", t, flags=re.M)            # blockquotes
+        t = t.replace("|", " ")                                     # tables
+
+        # Emojis & symbols TTS would vocalize as names
+        t = EMOJI_PATTERN.sub("", t)
+        # URLs are not meant to be read aloud
+        t = re.sub(r"https?://\S+", "", t)
+
+        # Normalize whitespace: collapse spaces, cap blank lines at two
+        t = re.sub(r"[ \t]+", " ", t)
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t.strip()
 
 
 # ========================================================================
-# Nanobot WebSocket Service
+# Direct OpenAI-compatible LLM service (replaces the nanobot gateway)
 # ========================================================================
 
-class NanobotWebSocketService(LLMService):
-    """LLM backend that streams responses from a **nanobot** gateway via WebSocket.
+class DeepSeekLLMService(LLMService):
+    """直连 OpenAI 兼容 ``/chat/completions`` 的流式 LLM 服务。
+
+    与原来的 nanobot 网关版相比，最大的区别是**对话历史在本地维护**
+    （nanobot 是服务端维护）：``compose_messages`` 把 system + 历史 + 本轮用户
+    输入一起发出去，``update_context`` 负责把用户消息和助手回复追加进历史。
 
     Parameters
     ----------
-    ws_url:
-        nanobot WebSocket endpoint, e.g. ``ws://127.0.0.1:8765/``.
-    token:
-        Shared secret that matches nanobot's ``channels.websocket.token``.
-    system_prompt:
-        Prepended to the first message of each chat.
+    base_url:
+        OpenAI 兼容端点，默认 ``https://api.deepseek.com``。
+    api_key:
+        API key，默认取 ``DEEPSEEK_API_KEY`` 环境变量。
     model:
-        Model name passed through to nanobot (default ``deepseek-v4-flash``).
+        模型名，默认 ``deepseek-flash``。
+    thinking:
+        是否开启思考模式，默认 False。语音场景首字优先，会显式发送
+        ``thinking={"type": "disabled"}`` 让服务端跳过思维链。
+    history_limit:
+        每个 context 最多保留的历史消息条数（超出丢最早的）。
     """
 
     def __init__(
         self,
         *,
-        ws_url: str = "ws://127.0.0.1:8765/",
-        token: str = None,
+        base_url: str = "https://api.deepseek.com",
+        api_key: str = None,
+        model: str = "deepseek-flash",
         system_prompt: str = None,
-        model: str = "deepseek-v4-flash",
         temperature: float = 0.5,
+        max_tokens: int = 300,
+        thinking: bool = False,
+        history_limit: int = 20,
+        timeout: float = 60.0,
         split_chars: List[str] = None,
+        option_split_chars: List[str] = None,
+        option_split_threshold: int = 50,
         voice_text_tag: str = None,
         context_tracker: ContextTracker = None,
         debug: bool = False,
@@ -259,144 +386,65 @@ class NanobotWebSocketService(LLMService):
             system_prompt=system_prompt,
             model=model,
             temperature=temperature,
-            split_chars=split_chars or ["。", "？", "！", ". ", "?", "!"],
+            split_chars=split_chars,
+            option_split_chars=option_split_chars,
+            option_split_threshold=option_split_threshold,
             voice_text_tag=voice_text_tag,
             context_tracker=context_tracker or ContextTracker(),
             debug=debug,
         )
-        self.ws_url = ws_url
-        self.token = token
-
-        # WebSocket state
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
-        self._ws_lock = asyncio.Lock()
-        self._recv_task: Optional[asyncio.Task] = None
-        self._default_chat_id: Optional[str] = None
-
-        # Per-chat multiplexing
-        self._queues: Dict[str, asyncio.Queue] = {}
-        self._pending_events: Dict[str, List[dict]] = {}
-        self._attach_future: Optional[asyncio.Future] = None
-
-        # litests context_id → nanobot chat_id
-        self._chat_map: Dict[str, str] = {}
-        self._system_prompt_sent: Dict[str, bool] = {}
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "LLM API key is required. Set DEEPSEEK_API_KEY env var or pass "
+                "llm_api_key=... (否则请求会带着 'Bearer None' 拿到 401)"
+            )
+        self.max_tokens = max_tokens
+        self.thinking = thinking
+        self.history_limit = history_limit
+        self.timeout = timeout
+        self._history: Dict[str, List[Dict]] = {}
+        self._client: Optional[httpx.AsyncClient] = None
 
     # ------------------------------------------------------------------
-    # Connection management
+    # Lifecycle
     # ------------------------------------------------------------------
 
-    async def _ensure_connection(self):
-        """Connect or reconnect the WebSocket."""
-        if self._ws is not None:
-            try:
-                await self._ws.ping()
-                return
-            except Exception:
-                if self.debug:
-                    logger.info("nanobot ping failed, reconnecting...")
-                self._ws = None
+    async def warmup(self):
+        """提前把 SSL 上下文和 httpx client 建好（启动时调一次）。
 
-        async with self._ws_lock:
-            if self._ws is not None:
-                return
-
-            url = self.ws_url
-            if self.token:
-                sep = "?" if "?" not in url else "&"
-                url = f"{url}{sep}token={self.token}"
-
-            if self.debug:
-                logger.info(f"Connecting nanobot: {url}")
-            self._ws = await websockets.connect(url)
-
-            # Wait for 'ready'
-            raw = await self._ws.recv()
-            evt = json.loads(raw)
-            if evt.get("event") != "ready":
-                logger.warning(f"Expected 'ready', got: {evt}")
-            self._default_chat_id = evt.get("chat_id")
-            logger.info(f"nanobot ready (chat_id={self._default_chat_id})")
-
-            # Start recv loop
-            if self._recv_task is None or self._recv_task.done():
-                self._recv_task = asyncio.create_task(self._recv_loop())
-
-    async def _recv_loop(self):
-        """Single consumer routing frames to per-chat queues."""
-        while True:
-            try:
-                raw = await self._ws.recv()
-            except ConnectionClosed as e:
-                logger.warning(f"nanobot closed: {e}")
-                self._ws = None
-                for q in self._queues.values():
-                    await q.put(None)
-                self._queues.clear()
-                self._pending_events.clear()
-                break
-            except Exception as e:
-                logger.error(f"nanobot recv error: {e}")
-                continue
-
-            evt = self._parse_event(raw)
-            evt_type = evt.get("event")
-            chat_id = evt.get("chat_id") or self._default_chat_id
-
-            if evt_type == "attached":
-                if self._attach_future and not self._attach_future.done():
-                    self._attach_future.set_result(chat_id)
-                continue
-
-            if chat_id:
-                if chat_id in self._queues:
-                    await self._queues[chat_id].put(evt)
-                else:
-                    self._pending_events.setdefault(chat_id, []).append(evt)
+        ``httpx.AsyncClient()`` 会同步创建 ssl 上下文（本机约 1s/个，而且是在
+        事件循环线程上执行），如果留到第一轮对话里建，这几秒就直接变成首字延时。
+        这里用 ``asyncio.to_thread`` 在线程里建，不占用事件循环。
+        """
+        if self._client is None:
+            verify = await asyncio.to_thread(self._build_ssl_context)
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout),
+                verify=verify,
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            )
 
     @staticmethod
-    def _parse_event(raw):
-        if isinstance(raw, str) and raw.startswith("{"):
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                return {"event": "delta", "text": raw}
-        if isinstance(raw, bytes):
-            try:
-                return json.loads(raw.decode())
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return {"event": "delta", "text": raw.decode(errors="replace")}
-        return {"event": "delta", "text": str(raw)}
+    def _build_ssl_context():
+        import ssl
 
-    # ------------------------------------------------------------------
-    # Chat lifecycle
-    # ------------------------------------------------------------------
+        import certifi
 
-    async def _create_chat(self) -> str:
-        await self._ensure_connection()
-        self._attach_future = asyncio.Future()
-        try:
-            await self._ws.send(json.dumps({"type": "new_chat"}))
-            chat_id = await asyncio.wait_for(self._attach_future, timeout=15.0)
-            logger.info(f"nanobot new chat: {chat_id}")
-            return chat_id
-        except asyncio.TimeoutError:
-            raise RuntimeError("nanobot new_chat timed out")
-        finally:
-            self._attach_future = None
+        return ssl.create_default_context(cafile=certifi.where())
 
-    def _get_or_create_queue(self, chat_id: str) -> asyncio.Queue:
-        if chat_id not in self._queues:
-            q = self._queues[chat_id] = asyncio.Queue()
-            for evt in self._pending_events.pop(chat_id, []):
-                q.put_nowait(evt)
-        return self._queues[chat_id]
+    async def shutdown(self):
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     # ------------------------------------------------------------------
     # LLMService interface
     # ------------------------------------------------------------------
 
-    async def compose_messages(self, context_id, text, files=None, system_prompt_params=None):
+    async def compose_messages(self, context_id, text, files=None, system_prompt_params=None,
+                               extra_messages=None):
         content = text
         if files:
             parts = [{"type": "text", "text": text}] if text else []
@@ -404,109 +452,101 @@ class NanobotWebSocketService(LLMService):
                 if url := f.get("url"):
                     parts.append({"type": "image_url", "image_url": {"url": url}})
             content = parts or text
-        return [{"role": "user", "content": content}]
+
+        messages: List[Dict] = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.extend(self._history.get(context_id, []))
+        if text or files:
+            messages.append({"role": "user", "content": content})
+        if extra_messages:
+            messages.extend(extra_messages)
+        return messages
 
     async def update_context(self, context_id, messages, response_text):
+        history = self._history.setdefault(context_id, [])
+        history.extend(messages)
+        if response_text:
+            history.append({"role": "assistant", "content": response_text})
+        if len(history) > self.history_limit:
+            del history[:-self.history_limit]
         self.context_tracker.touch(context_id)
 
-    async def get_llm_stream_response(self, context_id, user_id, messages, system_prompt_params=None):
-        # Extract user text
-        user_content = messages[-1]["content"] if messages else ""
-        if isinstance(user_content, list):
-            user_text = "\n".join(
-                p.get("text", "") for p in user_content
-                if isinstance(p, dict) and p.get("type") == "text"
-            )
-        else:
-            user_text = str(user_content)
+    async def get_llm_stream_response(self, context_id, user_id, messages,
+                                      system_prompt_params=None):
+        await self.warmup()
 
-        # Map context_id → chat_id
-        chat_id = self._chat_map.get(context_id)
-        is_new = chat_id is None
-        if is_new:
-            chat_id = await self._create_chat()
-            self._chat_map[context_id] = chat_id
-            self.context_tracker.touch(context_id)
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        if self.tools:
+            payload["tools"] = [t.spec for t in self.tools.values()]
+        if not self.thinking:
+            payload["thinking"] = {"type": "disabled"}  # 跳过思维链, 首字优先
+        headers = {"Authorization": f"Bearer {self.api_key}"}
 
-        # Prepend system prompt on first message
-        sp = self.system_prompt
-        if is_new and sp:
-            self._system_prompt_sent[context_id] = True
-            effective = f"[System instructions: {sp}]\n\nUser message: {user_text}"
-        elif sp and not self._system_prompt_sent.get(context_id):
-            self._system_prompt_sent[context_id] = True
-            effective = f"[System instructions: {sp}]\n\nUser message: {user_text}"
-        else:
-            effective = user_text
+        # tool_calls 在 SSE 里是**分片**下发的: index 索引, function.name 只出现在
+        # 首片, arguments 逐片拼接, 结束信号是 finish_reason="tool_calls"。
+        # 所以必须累加, 不能当普通 content 处理。
+        pending_calls: Dict[int, Dict[str, str]] = {}
+        first_token_reported = False
 
-        if not effective:
-            return
+        if self.on_request_start:
+            self.on_request_start()
 
-        if self.debug:
-            logger.info(f"nanobot send (chat={chat_id[:8]}...): {effective[:120]}")
+        async with self._client.stream(
+            "POST", f"{self.base_url}/chat/completions", json=payload, headers=headers
+        ) as resp:
+            if resp.status_code != 200:
+                body = (await resp.aread()).decode(errors="replace")
+                logger.error(f"LLM HTTP {resp.status_code}: {body[:300]}")
+                raise RuntimeError(f"LLM HTTP {resp.status_code}")
 
-        await self._ensure_connection()
-        await self._ws.send(json.dumps({
-            "type": "message", "chat_id": chat_id, "content": effective,
-        }))
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    choice = json.loads(data)["choices"][0]
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    if not first_token_reported and self.on_first_token:
+                        first_token_reported = True
+                        self.on_first_token()
+                    yield LLMResponse(context_id=context_id, text=delta["content"])
+                for tc in (delta.get("tool_calls") or []):
+                    idx = tc.get("index", 0)
+                    slot = pending_calls.setdefault(idx, {"id": "", "name": "", "args": ""})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
 
-        queue = self._get_or_create_queue(chat_id)
-
-        # stream_end is NOT an end-of-turn signal — nanobot may send
-        # multiple stream_end events within a single turn (e.g. after
-        # reasoning, after intermediate text before tool execution, and
-        # after the final response).  The only reliable terminal signal
-        # is turn_end.
-        while True:
-            evt = await queue.get()
-            if evt is None:
-                logger.info("[nanobot] ═══ connection closed ═══")
-                break
-
-            etype = evt.get("event")
-            # Dump full event for comparison
-            text_preview = str(evt.get("text", ""))[:80]
-            name = evt.get("name", "")
-            detail = evt.get("detail", "")
-            extra = f" name={name}" if name else ""
-            extra += f" detail={detail}" if detail else ""
-            # logger.info(f"[nanobot] type={etype} text={text_preview!r}{extra}")
-
-            if etype == "delta":
-                yield LLMResponse(context_id=context_id, text=evt.get("text", ""))
-            elif etype == "message":
-                text = evt.get("text", "")
-                if text:
-                    yield LLMResponse(context_id=context_id, text=text)
-            elif etype == "turn_end":
-                logger.info("[nanobot] ═══ turn_end → break ═══")
-                break
-            elif etype == "error":
-                logger.error(f"nanobot error: {evt.get('detail')}")
-                break
-            elif etype in ("tool_call", "tool_result", "reasoning_delta",
-                           "reasoning_end", "stream_end", "session_updated",
-                           "goal_status"):
-                pass  # intermediate events, logged above
-            # catch-all for truly unknown event types
-            elif not etype:
-                pass
+        for idx in sorted(pending_calls):
+            slot = pending_calls[idx]
+            if not slot["name"]:
+                continue
+            raw = slot["args"].strip()
+            if not raw:
+                args = {}
             else:
-                logger.info(f"[nanobot] *** unhandled event type: {etype}")
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    async def shutdown(self):
-        if self._recv_task:
-            self._recv_task.cancel()
-            try:
-                await self._recv_task
-            except asyncio.CancelledError:
-                pass
-            self._recv_task = None
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
-            logger.info("nanobot closed")
+                try:
+                    args = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning(f"工具 {slot['name']} 参数不是合法 JSON: {raw[:120]}")
+                    args = {"_raw": raw}
+            yield LLMResponse(
+                context_id=context_id,
+                tool_call=ToolCall(id=slot["id"] or None, name=slot["name"], arguments=args),
+            )
