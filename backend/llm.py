@@ -201,6 +201,7 @@ class LLMService(ABC):
         system_prompt_params: Dict = None,
         extra_messages: List[Dict] = None,
         persist: bool = True,
+        dynamic_context: str = None,
     ) -> AsyncGenerator[LLMResponse, None]:
         """High-level streaming entry point with text splitting & voice extraction.
 
@@ -212,6 +213,9 @@ class LLMService(ABC):
         persist:
             False 表示本轮结束不落历史 —— 多轮工具调用时由上层在本轮真正结束时
             调 :meth:`append_turn` 统一落一次。
+        dynamic_context:
+            每轮实时生成的环境说明（当前时间、后台任务状态…），作为一条 system
+            消息插在主 system prompt 之后。**不进历史**：它每次都要重新算。
         """
         logger.info(f"User: {text}")
         text = self._request_filter(text)
@@ -221,7 +225,7 @@ class LLMService(ABC):
 
         extra_messages = extra_messages or []
         messages = await self.compose_messages(context_id, text, files, system_prompt_params,
-                                              extra_messages)
+                                              extra_messages, dynamic_context)
         user_msg_index = len(messages) - 1 - len(extra_messages)
 
         stream_buffer = ""
@@ -444,7 +448,7 @@ class DeepSeekLLMService(LLMService):
     # ------------------------------------------------------------------
 
     async def compose_messages(self, context_id, text, files=None, system_prompt_params=None,
-                               extra_messages=None):
+                               extra_messages=None, dynamic_context=None):
         content = text
         if files:
             parts = [{"type": "text", "text": text}] if text else []
@@ -456,6 +460,11 @@ class DeepSeekLLMService(LLMService):
         messages: List[Dict] = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
+        if dynamic_context:
+            # 实时环境（当前时间 / 后台任务状态）。**不进历史**：它每轮都要重算。
+            # 少了它，模型不知道今天几号（会往委托任务里写错年份），也不知道后台
+            # 到底有没有任务在跑（会编出"还在查"）。
+            messages.append({"role": "system", "content": dynamic_context})
         messages.extend(self._history.get(context_id, []))
         if text or files:
             messages.append({"role": "user", "content": content})

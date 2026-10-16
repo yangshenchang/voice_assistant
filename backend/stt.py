@@ -30,6 +30,28 @@ class SpeechRecognizer(ABC):
         """Transcribe PCM audio to text. Returns empty string on failure."""
 
 
+class NullSpeechRecognizer(SpeechRecognizer):
+    """占位识别器：**文本模式专用**，不持有任何凭据、不联网。
+
+    为什么需要它：``AliyunASRSpeechRecognizer`` 在**构造时**就要求 API key，
+    于是"只想用文本模式跑链路逻辑"的场景会因为缺 DASHSCOPE key 直接崩在启动
+    阶段 —— 明明整条文本路径一行 STT 都不经过。
+
+    这个类让 pipeline 能在没有 STT 凭据的情况下构造成功；而一旦真有人把音频喂
+    进来，它会**明确抛错**而不是假装返回空串 —— 静默返回空串会让"文本模式误接
+    麦克风"这类接线错误变得极难定位。
+    """
+
+    def __init__(self, *, debug: bool = False):
+        super().__init__(language=None, debug=debug)
+
+    async def transcribe(self, pcm_data: bytes) -> str:
+        raise RuntimeError(
+            "当前使用 NullSpeechRecognizer（文本模式）：没有可用的语音识别后端。"
+            " 请配置 DASHSCOPE_API_KEY，或改用文本输入（run.py --ask / --text）。"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Aliyun DashScope ASR
 # ---------------------------------------------------------------------------

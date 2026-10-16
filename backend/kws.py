@@ -20,8 +20,10 @@ import sherpa_onnx
 logger = logging.getLogger(__name__)
 
 # Default model directory (extracted from the tarball)
+# 注意：本模块在 backend/ 下，模型目录在**仓库根**，所以是 parent.parent。
+# 搬进 backend/ 时这里漏改过，直接导致启动报 FileNotFoundError（实测踩到）。
 _MODEL_DIR = (
-    Path(__file__).parent
+    Path(__file__).resolve().parent.parent
     / "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
 )
 

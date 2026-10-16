@@ -19,3 +19,7 @@ PyAudio>=0.2.14
 
 # --- TTS / HTTP ---
 httpx>=0.27.0
+
+# --- 远端接入的自签 TLS 证书（transport/tls.py 生成证书用）---
+# 手机浏览器的麦克风只在安全上下文可用，所以局域网 https 是可用性前提而非可选项
+cryptography>=41.0.0

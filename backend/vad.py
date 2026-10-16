@@ -197,6 +197,17 @@ class StandardSpeechDetector(SpeechDetector):
         self._sessions.pop(session_id, None)
 
     def is_recording(self, session_id: str = None) -> bool:
+        """该会话当前是否正在录音。
+
+        ``session_id=None`` 表示"**有没有任何**会话在录音" —— 这个语义是被调用方
+        依赖的：pipeline 判断"现在能不能开口"时必须问**整体**状态，因为 VAD 的音频
+        来自同一支麦克风（共享资源），按单个会话查会在"别人的会话正在录"时误判为空闲。
+
+        实测踩过的坑：这个分支原来写成 ``self._sessions.get(None)``，恒为 None →
+        **永远返回 False**，于是"本机在录音时不开口"这条保护实际上从未生效过。
+        """
+        if session_id is None:
+            return any(s.is_recording for s in self._sessions.values())
         s = self._sessions.get(session_id)
         return bool(s and s.is_recording)
 

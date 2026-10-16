@@ -15,7 +15,8 @@
                 "DASHSCOPE_API_KEY": "${env:DASHSCOPE_API_KEY}",
                 "OPENCLAW_API_KEY": "${env:OPENCLAW_API_KEY}",
                 "BAIDU_TTS_API_KEY": "${env:BAIDU_TTS_API_KEY}",
-                "BAIDU_TTS_SECRET_KEY": "${env:BAIDU_TTS_SECRET_KEY}"
+                "BAIDU_TTS_SECRET_KEY": "${env:BAIDU_TTS_SECRET_KEY}",
+                "DEEPSEEK_API_KEY":"${env:DEEPSEEK_API_KEY}"
             }
         }
     ]

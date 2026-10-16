@@ -26,9 +26,12 @@ import pyaudio
 from dashscope.audio.tts_v2 import AudioFormat, ResultCallback, SpeechSynthesizer
 
 # 复用工程内的现成模块(VAD切句 / 阿里云ASR)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from stt import AliyunASRSpeechRecognizer
-from vad import StandardSpeechDetector
+# 本文件已移入 legacy/（历史参考，不参与现链路）。
+# 它在当年的位置是仓库根，直接 `from stt import ...`；现在需要把包挂上。
+_PKG_PARENT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _PKG_PARENT)
+from voice_assistant.backend.stt import AliyunASRSpeechRecognizer
+from voice_assistant.backend.vad import StandardSpeechDetector
 
 # ============================================================
 # 配置

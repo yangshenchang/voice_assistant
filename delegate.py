@@ -1,6 +1,6 @@
 """复杂任务委托（delegate）客户端 + 播报调度。
 
-对应 `bt_assistant/qqbot_relay`（常驻在 qqbot profile 内的中继插件）：
+对应 `qqbot_relay/`（常驻在 qqbot profile 内的中继插件）：
   POST /task        → 202 {taskId}        提交(立即返回, 异步执行)
   GET  /task/<id>   → {state, progress[], headline, full, qq...}
   POST /cancel      → 取消当前任务
@@ -54,6 +54,8 @@ class DelegateTask:
         self.phrases: List[str] = []       # 口语化进度短语(去重保序)
         self.raw_progress = 0              # 已消费的原始进度条数
         self.announced_phrases = 0         # 已播报到的短语位置
+        #: 结果是否已播报过（幂等保护：防止同一结论被播两遍、并写两遍历史）
+        self.result_announced = False
         self.started_at = time.time()
         self.last_announce_at = 0.0
         self.finished_at: Optional[float] = None
@@ -257,6 +259,14 @@ class DelegateManager:
         await self._announce_text(rec, f"刚才那个问题还在查，{detail}。")
 
     async def _announce_result(self, rec: DelegateTask):
+        # 幂等保护（多道）：结果播报只应发生一次。重复播报的观感是"助手把同一句
+        # 结论说了两遍"，而且它还会被写两遍历史。这里用**独立的标志位**兜底 ——
+        # 状态机（state=="done"）本身不足以防止重复调用路径。
+        if rec.result_announced:
+            logger.info(f"委托 {rec.id} 结果已播报过, 跳过重复播报")
+            return
+        rec.result_announced = True
+
         text = rec.headline or "刚才那个问题有结果了。"
         if not text.startswith("刚才") and not text.startswith("顺便"):
             text = f"刚才那个问题有结果了：{text}"

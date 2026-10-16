@@ -71,6 +71,34 @@ class SpeechSynthesizer(ABC):
         pass
 
 
+class NullSpeechSynthesizer(SpeechSynthesizer):
+    """占位合成器：**文本模式专用**，不持有凭据、不联网、不产音频。
+
+    为什么需要它：``CosyVoiceSpeechSynthesizer`` 在**构造时**就要求 API key。
+    只想跑文本链路（不需要 TTS）时，不该因此崩在启动阶段。
+
+    与 :class:`~voice_assistant.stt.NullSpeechRecognizer` 同样的取舍：真的被调用
+    时**明确抛错**，而不是返回空音频 —— 后者会让"文本模式误走播报路径"变成
+    静默无声，极难定位。
+    """
+
+    def __init__(self, *, debug: bool = False):
+        super().__init__(sample_rate=16000, debug=debug)
+
+    async def synthesize(self, text: str, language: str = None) -> bytes:
+        raise RuntimeError(
+            "当前使用 NullSpeechSynthesizer（文本模式未启用合成）：没有可用的语音合成后端。"
+            " 请配置 DASHSCOPE_API_KEY，或在文本模式下加 --with-tts。"
+        )
+
+    async def synthesize_stream(self, text: str, language: str = None):
+        raise RuntimeError(
+            "当前使用 NullSpeechSynthesizer（文本模式未启用合成）：没有可用的语音合成后端。"
+            " 请配置 DASHSCOPE_API_KEY，或在文本模式下加 --with-tts。"
+        )
+        yield b""          # pragma: no cover —— 让它仍是异步生成器
+
+
 # ---------------------------------------------------------------------------
 # CosyVoice TTS (Alibaba Cloud DashScope) — Recommended
 # ---------------------------------------------------------------------------

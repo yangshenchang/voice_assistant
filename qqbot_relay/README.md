@@ -27,7 +27,7 @@
 
 ```powershell
 # 1) 把插件链进 profile（dsh 会自动把它加进 dsh.profile.bundles）
-dsh plugin --profile qqbot add "C:\Users\zj\Desktop\voice_assistant\bt_assistant\qqbot_relay"
+dsh plugin --profile qqbot add "C:\Users\zj\Desktop\voice_assistant\qqbot_relay"
 
 # 2) 重启机器人（进程内加载插件）
 

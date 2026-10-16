@@ -1,8 +1,27 @@
+# Python
 __pycache__/
 *.py[cod]
 *.db
-*.wav
 .env
-sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01
+
+# 音频素材与本地缓存
+*.wav
 .npm-cache
-bt_assistant/verify/
+
+# 唤醒词模型（体积大，本地自带，不入库）
+sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01
+
+# 验证脚本属"工具"而非产品代码
+tests/
+
+# 编辑器本地配置（含明文 key，绝不入库）
+.vscode/launch.json
+
+# 运行时产物
+#   自签 TLS 证书与私钥（由 transport/tls.py 首次运行自动生成，私钥绝不入库）
+data/certs/
+*.crt
+*.key
+*.pem
+#   逐轮时延基线是"测量数据"不是源码，会持续增长且每跑一次就产生 diff
+data/metrics/

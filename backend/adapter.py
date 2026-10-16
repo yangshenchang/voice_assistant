@@ -10,12 +10,18 @@ import queue
 import struct
 import threading
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import pyaudio
 
 from ..models import STSResponse
-from ..pipeline import VoiceAssistant
+
+if TYPE_CHECKING:
+    # ⚠️ 只在类型检查时导入：`pipeline` 会导入 `backend`，若这里在运行时光溜溜地
+    # `from ..pipeline import VoiceAssistant` 就会构成**循环导入**
+    # （整理成 backend/ 包后立刻踩到：backend 被 pipeline 导入 → 又反过来导入 pipeline）。
+    # 本模块只在类型标注里用到它，故放进 TYPE_CHECKING。
+    from ..pipeline import VoiceAssistant
 
 logger = logging.getLogger(__name__)
 

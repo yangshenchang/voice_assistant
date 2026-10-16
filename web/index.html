@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#111318" />
+<title>小牛 · 语音通话</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; min-height: 100vh; background: #111318; color: #e8eaed;
+    font: 15px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    padding: max(12px, env(safe-area-inset-top)) 14px 24px; gap: 12px; user-select: none;
+  }
+  h1 { font-size: 17px; margin: 4px 0 0; font-weight: 600; letter-spacing: .5px; }
+
+  /* 通话状态区 */
+  .dial { display: flex; flex-direction: column; align-items: center; gap: 6px; margin: 6px 0 2px; }
+  .avatar {
+    width: 96px; height: 96px; border-radius: 50%; background: #1f2530;
+    border: 2px solid #2b313c; display: grid; place-items: center; font-size: 40px;
+    transition: border-color .25s, box-shadow .25s, transform .12s;
+  }
+  /* 四种可视化状态：待机 / 正在听 / 正在说 / 处理中 */
+  .avatar.idle    { border-color: #2b313c; }
+  .avatar.listening { border-color: #35c07a; box-shadow: 0 0 0 6px rgba(53,192,122,.12); }
+  .avatar.speaking  { border-color: #2d6cdf; box-shadow: 0 0 0 10px rgba(45,108,223,.18); transform: scale(1.04); }
+  .avatar.thinking  { border-color: #d3a23a; box-shadow: 0 0 0 6px rgba(211,162,58,.14); }
+  .state { font-size: 15px; font-weight: 600; }
+  .state.idle { color: #9aa4b2; } .state.listening { color: #56d99a; }
+  .state.speaking { color: #7fb0ff; } .state.thinking { color: #e6c163; }
+  .hint { font-size: 12px; color: #7d8794; min-height: 16px; }
+
+  .card { width: 100%; max-width: 460px; background: #1a1d24; border: 1px solid #262b34;
+          border-radius: 14px; padding: 12px 14px; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  label { font-size: 12px; color: #8b93a1; white-space: nowrap; }
+  input { flex: 1; min-width: 0; background: #0e1014; color: #e8eaed;
+          border: 1px solid #2b313c; border-radius: 9px; padding: 8px 10px; font-size: 14px; }
+  button { border: 0; border-radius: 10px; padding: 10px 14px; font-size: 14px;
+           background: #2b313c; color: #e8eaed; cursor: pointer; font-weight: 500; }
+  button:disabled { opacity: .45; }
+
+  /* 通话主按钮 */
+  #call {
+    width: 100%; max-width: 460px; padding: 22px 16px; font-size: 19px; font-weight: 700;
+    background: #1d3a2a; color: #8ef0b6; border: 2px solid #35c07a; border-radius: 18px;
+  }
+  #call.on { background: #3a1d22; color: #ffb3b3; border-color: #e05252; }
+  #call.busy { background: #33373d; color: #8b93a1; border-color: #3a3f47; }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 12px; color: #9aa4b2; }
+  .stats b { color: #e8eaed; font-weight: 600; }
+  .stats .ok { color: #56d99a; } .stats .warn { color: #e6c163; }
+  #log { width: 100%; max-width: 460px; height: 30vh; overflow-y: auto; background: #0e1014;
+         border: 1px solid #262b34; border-radius: 14px; padding: 10px 12px;
+         font: 12.5px/1.55 ui-monospace, "Cascadia Mono", monospace;
+         white-space: pre-wrap; word-break: break-word; }
+  .me { color: #7fd1a5; } .ai { color: #cfe0ff; } .sys { color: #8b93a1; }
+  .err { color: #ff8f8f; } .warn { color: #ffd479; }
+  .sw { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #9aa4b2; }
+  .sw input { flex: none; width: 16px; height: 16px; }
+</style>
+</head>
+<body>
+  <h1>小牛 · 通话中</h1>
+
+  <div class="dial">
+    <div class="avatar idle" id="avatar">🐮</div>
+    <div class="state idle" id="state">未接通</div>
+    <div class="hint" id="hint">点下方按钮接通，然后直接说话</div>
+  </div>
+
+  <button id="call">接通</button>
+
+  <div class="card">
+    <div class="row">
+      <label for="token">口令</label>
+      <input id="token" type="password" placeholder="服务端 --no-auth 时留空" />
+    </div>
+    <div class="row" style="margin-top:8px">
+      <span class="sw"><input type="checkbox" id="auto" checked /><label for="auto">打开即自动接通</label></span>
+      <span class="sw"><input type="checkbox" id="duplex" /><label for="duplex">免提全双工（可打断，需戴耳机）</label></span>
+    </div>
+  </div>
+
+  <div class="card stats">
+    <span>通话 <b id="dur">00:00</b></span>
+    <span>网络 <b id="rtt">—</b></span>
+    <span>上行 <b id="up">0</b></span>
+    <span>丢帧 <b id="drop">0</b></span>
+    <span>回声抑制 <b id="echo" class="ok">开</b></span>
+    <span>本轮 <b id="turn">—</b></span>
+  </div>
+
+  <div id="log"></div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
